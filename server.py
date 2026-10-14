@@ -671,6 +671,102 @@ def get_workout_detail(date: str, index: int = 0) -> dict:
     return {"date": date, "index": index, **_compact_workout(ws[index], keep_splits=True)}
 
 
+def _wk_km(w: dict) -> Optional[float]:
+    d = w.get("distance")
+    if isinstance(d, dict) and isinstance(d.get("qty"), (int, float)):
+        u = str(d.get("units", "km")).lower()
+        return d["qty"] * (1.609344 if u.startswith("mi") else 0.001 if u == "m" else 1.0)
+    return None
+
+
+def _wk_hr(w: dict) -> Optional[float]:
+    for k in ("avgHeartRate",):
+        v = w.get(k)
+        if isinstance(v, dict):
+            v = v.get("qty")
+        if isinstance(v, (int, float)):
+            return float(v)
+    r = (w.get("fc_serie_resumen") or {}).get("media")
+    return float(r) if isinstance(r, (int, float)) else None
+
+
+@mcp.tool()
+def get_trends(days: int = 14) -> dict:
+    """Tendencias de los últimos N días (por defecto 14, máx. 60) para
+    valorar la recuperación y la carga de entrenamiento: tabla diaria
+    (pasos, kcal activas, FC en reposo, HRV, horas de sueño, nº de entrenos
+    y km) más medias de la última semana frente a la anterior, y resumen
+    de carreras (km, sesiones, ritmo medio, FC media) por semana."""
+    days = max(2, min(int(days), 60))
+    end = datetime.date.today()
+    rows, weeks = [], {}
+    for i in range(days - 1, -1, -1):
+        day = end - datetime.timedelta(days=i)
+        data = _upstash_get(f"healthdata:{day.isoformat()}")
+        if data is None:
+            continue
+        sm = _summarize_day(data, detail=False)
+        m = sm["metrics"]
+
+        def tot(n):
+            return (m.get(n) or {}).get("total")
+
+        def avg(n):
+            return (m.get(n) or {}).get("media")
+
+        act = tot("active_energy")
+        if act is not None and "kj" in str((m["active_energy"].get("unidades") or "")).lower():
+            act = act / 4.184
+        sleep_h = None
+        if sm["sleep"]:
+            sleep_h = sm["sleep"][0].get("totalSleep") or sm["sleep"][0].get("asleep")
+        km = sum(_wk_km(w) or 0 for w in sm["workouts"])
+        rows.append({
+            "fecha": day.isoformat(),
+            "pasos": tot("step_count"),
+            "kcal_activas": _r(act, 0),
+            "fc_reposo": avg("resting_heart_rate"),
+            "hrv": avg("heart_rate_variability"),
+            "sueno_h": sleep_h,
+            "entrenos": len(sm["workouts"]),
+            "km_entrenos": _r(km, 2) if km else 0,
+        })
+        wk_id = day.isocalendar()
+        wkey = f"{wk_id[0]}-S{wk_id[1]:02d}"
+        for w in sm["workouts"]:
+            name = str(w.get("name", "")).lower()
+            kmw = _wk_km(w)
+            if kmw and any(x in name for x in ("run", "carrera", "correr")):
+                b = weeks.setdefault(wkey, {"sesiones": 0, "km": 0.0, "seg": 0.0, "fc": []})
+                b["sesiones"] += 1
+                b["km"] += kmw
+                b["seg"] += float(w.get("duration") or 0)
+                hr = _wk_hr(w)
+                if hr:
+                    b["fc"].append(hr)
+
+    def mean(key, chunk):
+        v = [r[key] for r in chunk if isinstance(r.get(key), (int, float))]
+        return _r(sum(v) / len(v), 1) if v else None
+
+    last, prev = rows[-7:], rows[-14:-7]
+    comp = {
+        k: {"ultimos_7d": mean(k, last), "7d_anteriores": mean(k, prev)}
+        for k in ("pasos", "kcal_activas", "fc_reposo", "hrv", "sueno_h")
+    }
+    carreras = {}
+    for k, b in sorted(weeks.items()):
+        pace = None
+        if b["km"] > 0 and b["seg"] > 0:
+            sp = b["seg"] / b["km"]
+            pace = f"{int(sp // 60)}:{int(sp % 60):02d}"
+        carreras[k] = {
+            "sesiones": b["sesiones"], "km": _r(b["km"], 1), "ritmo_medio_min_km": pace,
+            "fc_media": _r(sum(b["fc"]) / len(b["fc"]), 0) if b["fc"] else None,
+        }
+    return {"dias": rows, "comparativa_semanal": comp, "carreras_por_semana": carreras}
+
+
 if __name__ == "__main__":
     mcp.settings.host = "0.0.0.0"
     mcp.settings.port = int(os.environ.get("PORT", 8000))
